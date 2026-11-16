@@ -1,0 +1,296 @@
+EXCEL POWER QUERY ISOTOPOLOGUE GENERATOR
+=========================================
+
+OUTPUT
+------
+Light     - unlabelled molecules, with adducts standardized to [M...]
+Carbon    - M1C13 through the number of carbon atoms
+Nitrogen  - M1N15 through the number of nitrogen atoms
+Combined  - for EACH molecule: Light, then Carbon, then Nitrogen
+
+Sorting:
+1. Molecule List Name (A-Z)
+2. Molecule Name (A-Z)
+3. Light, Carbon, Nitrogen
+4. Isotopologue count ascending
+
+Carbon-only and nitrogen-only variants are collated in Combined.
+No doubly labelled carbon+nitrogen variants are generated.
+
+INPUT SETUP
+-----------
+1. Put the source molecules in an Excel worksheet.
+2. Select the range and press Ctrl+T to make it an Excel Table.
+3. In Table Design, set the table name to: Molecules
+4. Use these exact column headings:
+   Molecule List Name
+   Molecule Name
+   Precursor Adduct
+   Explicit Retention Time
+   Explicit Retention Time Window
+   Molecular Formula
+5. One row per molecule. Add new molecules at the bottom of this table.
+6. Adducts can be [M+H] or M+H. Output is always bracketed, e.g. [M+H].
+
+POWER QUERY SETUP
+-----------------
+Create a blank query:
+  Data > Get Data > From Other Sources > Blank Query
+Open Home > Advanced Editor, paste MAIN QUERY below, then name it
+Generated_All.
+
+Set Generated_All to Connection Only:
+  Home > Close & Load > Close & Load To... > Only Create Connection
+
+Then create four reference queries:
+  In the Queries pane, right-click Generated_All > Reference.
+  Rename the query, open Advanced Editor, and replace its contents with
+  the corresponding short query below.
+
+Create these four queries: Light, Carbon, Nitrogen, Combined.
+Load each to a worksheet using Close & Load To... > Table > New worksheet.
+Rename the worksheet tabs to match the query names.
+
+When you add molecules to the Molecules Excel table:
+  Data > Refresh All
+
+MAIN QUERY — name this query Generated_All
+------------------------------------------
+let
+    Source0 = Excel.CurrentWorkbook(){[Name="Molecules"]}[Content],
+
+    RequiredColumns = {
+        "Molecule List Name",
+        "Molecule Name",
+        "Precursor Adduct",
+        "Explicit Retention Time",
+        "Explicit Retention Time Window",
+        "Molecular Formula"
+    },
+
+    MissingColumns = List.Difference(RequiredColumns, Table.ColumnNames(Source0)),
+    Source =
+        if List.Count(MissingColumns) > 0 then
+            error "Missing required input columns: " & Text.Combine(MissingColumns, ", ")
+        else
+            Table.SelectColumns(Source0, RequiredColumns),
+
+    NormalizeAdduct = (adduct as any) as text =>
+        let
+            Raw = if adduct = null then "" else Text.Trim(Text.From(adduct)),
+            Core =
+                if Text.StartsWith(Raw, "[") and Text.EndsWith(Raw, "]") then
+                    Text.Range(Raw, 1, Text.Length(Raw) - 2)
+                else
+                    Raw,
+            Checked =
+                if Core = "" or not Text.StartsWith(Core, "M") then
+                    error "Invalid precursor adduct: " & Raw & ". Expected M+H or [M+H] notation."
+                else
+                    Core
+        in
+            "[" & Checked & "]",
+
+    // Count atoms in simple formulae such as C10H16N5O14P3.
+    CountElement = (formulaValue as any, targetElement as text) as number =>
+        let
+            Formula =
+                if formulaValue = null then
+                    error "A molecular formula is missing."
+                else
+                    Text.Remove(Text.Trim(Text.From(formulaValue)), {" ", Character.FromNumber(160)}),
+
+            Chars = Text.ToList(Formula),
+            IsUpper = (ch as text) as logical =>
+                Text.Upper(ch) = ch and Text.Lower(ch) <> ch,
+            IsLower = (ch as text) as logical =>
+                Text.Lower(ch) = ch and Text.Upper(ch) <> ch,
+            IsDigit = (ch as text) as logical =>
+                List.Contains({"0","1","2","3","4","5","6","7","8","9"}, ch),
+
+            FlushToken = (state as record) as list =>
+                if state[Symbol] = "" then
+                    state[Tokens]
+                else
+                    state[Tokens] & {
+                        [
+                            Element = state[Symbol],
+                            Count = if state[Digits] = "" then 1 else Number.FromText(state[Digits])
+                        ]
+                    },
+
+            FinalState =
+                List.Accumulate(
+                    Chars,
+                    [Symbol = "", Digits = "", Tokens = {}],
+                    (state as record, ch as text) as record =>
+                        if IsUpper(ch) then
+                            [Symbol = ch, Digits = "", Tokens = FlushToken(state)]
+                        else if IsLower(ch) and state[Symbol] <> "" and state[Digits] = "" then
+                            [Symbol = state[Symbol] & ch, Digits = "", Tokens = state[Tokens]]
+                        else if IsDigit(ch) and state[Symbol] <> "" then
+                            [Symbol = state[Symbol], Digits = state[Digits] & ch, Tokens = state[Tokens]]
+                        else
+                            error "Could not parse molecular formula: " & Formula
+                ),
+
+            Tokens = FlushToken(FinalState),
+            MatchingTokens = List.Select(Tokens, each [Element] = targetElement),
+            Total = List.Sum(List.Transform(MatchingTokens, each [Count]))
+        in
+            Total,
+
+    MakeVariant = (
+        molecule as record,
+        isotopeType as text,
+        isotopeNumber as number,
+        isotopeLabel as text,
+        categoryOrder as number
+    ) as record =>
+        let
+            Normalized = NormalizeAdduct(Record.Field(molecule, "Precursor Adduct")),
+            Adduct =
+                if isotopeLabel = "" then
+                    Normalized
+                else
+                    "[M" & Text.From(isotopeNumber) & isotopeLabel &
+                    Text.Range(Normalized, 2, Text.Length(Normalized) - 3) & "]",
+            WithAdduct = Record.TransformFields(molecule, {{"Precursor Adduct", each Adduct}}),
+            WithType = Record.AddField(WithAdduct, "__IsotopeType", isotopeType),
+            WithCategoryOrder = Record.AddField(WithType, "__CategoryOrder", categoryOrder),
+            WithNumber = Record.AddField(WithCategoryOrder, "__IsotopeNumber", isotopeNumber)
+        in
+            WithNumber,
+
+    MoleculeRecords = Table.ToRecords(Source),
+
+    GeneratedRecords =
+        List.Combine(
+            List.Transform(
+                MoleculeRecords,
+                (molecule as record) as list =>
+                    let
+                        CarbonCount = CountElement(Record.Field(molecule, "Molecular Formula"), "C"),
+                        NitrogenCount = CountElement(Record.Field(molecule, "Molecular Formula"), "N"),
+                        LightRows = {MakeVariant(molecule, "Light", 0, "", 0)},
+                        CarbonRows =
+                            if CarbonCount = 0 then {} else
+                                List.Transform(
+                                    {1..CarbonCount},
+                                    (n as number) => MakeVariant(molecule, "Carbon", n, "C13", 1)
+                                ),
+                        NitrogenRows =
+                            if NitrogenCount = 0 then {} else
+                                List.Transform(
+                                    {1..NitrogenCount},
+                                    (n as number) => MakeVariant(molecule, "Nitrogen", n, "N15", 2)
+                                )
+                    in
+                        List.Combine({LightRows, CarbonRows, NitrogenRows})
+            )
+        ),
+
+    OutputColumns = RequiredColumns & {
+        "__IsotopeType", "__CategoryOrder", "__IsotopeNumber"
+    },
+    Generated = Table.FromRecords(GeneratedRecords, OutputColumns, MissingField.UseNull),
+
+    AddListSort = Table.AddColumn(
+        Generated, "__ListSort",
+        each if [#"Molecule List Name"] = null then "" else Text.Lower(Text.From([#"Molecule List Name"])),
+        type text
+    ),
+    AddMoleculeSort = Table.AddColumn(
+        AddListSort, "__MoleculeSort",
+        each if [#"Molecule Name"] = null then "" else Text.Lower(Text.From([#"Molecule Name"])),
+        type text
+    ),
+    Sorted = Table.Sort(AddMoleculeSort, {
+        {"__ListSort", Order.Ascending},
+        {"__MoleculeSort", Order.Ascending},
+        {"__CategoryOrder", Order.Ascending},
+        {"__IsotopeNumber", Order.Ascending}
+    })
+in
+    Sorted
+
+
+REFERENCE QUERY — Light
+-----------------------
+let
+    Source = Generated_All,
+    Filtered = Table.SelectRows(Source, each [__IsotopeType] = "Light"),
+    Sorted = Table.Sort(Filtered, {
+        {"__ListSort", Order.Ascending},
+        {"__MoleculeSort", Order.Ascending}
+    }),
+    Output = Table.RemoveColumns(Sorted, {
+        "__IsotopeType", "__CategoryOrder", "__IsotopeNumber",
+        "__ListSort", "__MoleculeSort"
+    })
+in
+    Output
+
+
+REFERENCE QUERY — Carbon
+------------------------
+let
+    Source = Generated_All,
+    Filtered = Table.SelectRows(Source, each [__IsotopeType] = "Carbon"),
+    Sorted = Table.Sort(Filtered, {
+        {"__ListSort", Order.Ascending},
+        {"__MoleculeSort", Order.Ascending},
+        {"__IsotopeNumber", Order.Ascending}
+    }),
+    Output = Table.RemoveColumns(Sorted, {
+        "__IsotopeType", "__CategoryOrder", "__IsotopeNumber",
+        "__ListSort", "__MoleculeSort"
+    })
+in
+    Output
+
+
+REFERENCE QUERY — Nitrogen
+--------------------------
+let
+    Source = Generated_All,
+    Filtered = Table.SelectRows(Source, each [__IsotopeType] = "Nitrogen"),
+    Sorted = Table.Sort(Filtered, {
+        {"__ListSort", Order.Ascending},
+        {"__MoleculeSort", Order.Ascending},
+        {"__IsotopeNumber", Order.Ascending}
+    }),
+    Output = Table.RemoveColumns(Sorted, {
+        "__IsotopeType", "__CategoryOrder", "__IsotopeNumber",
+        "__ListSort", "__MoleculeSort"
+    })
+in
+    Output
+
+
+REFERENCE QUERY — Combined
+--------------------------
+let
+    Source = Generated_All,
+    Sorted = Table.Sort(Source, {
+        {"__ListSort", Order.Ascending},
+        {"__MoleculeSort", Order.Ascending},
+        {"__CategoryOrder", Order.Ascending},
+        {"__IsotopeNumber", Order.Ascending}
+    }),
+    Output = Table.RemoveColumns(Sorted, {
+        "__IsotopeType", "__CategoryOrder", "__IsotopeNumber",
+        "__ListSort", "__MoleculeSort"
+    })
+in
+    Output
+
+
+NOTES
+-----
+- Formula parser supports ordinary formulae such as C10H16N5O14P3.
+- It does not support parentheses, dot-hydrates, charge suffixes, or
+  isotope-specific element notation.
+- Molecular Formula is copied unchanged; it is only used to determine
+  the maximum number of heavy isotopes.
+- The source input table is never overwritten by the queries.
